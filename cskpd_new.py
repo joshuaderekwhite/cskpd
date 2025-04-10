@@ -7,7 +7,7 @@ import itertools
 from numpy import ravel as vec
 from collections import namedtuple
 from joblib import Parallel,delayed
-from sklearn.model_selection import KFold, cross_validate
+from sklearn.model_selection import KFold, cross_validate, StratifiedKFold
 from sklearn.metrics import make_scorer, mean_squared_error, roc_auc_score, confusion_matrix, check_scoring
 from convolution import convolution
 import random
@@ -15,29 +15,36 @@ import warnings
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import roc_auc_score, mean_squared_error
 def auc(y_true, y_pred):
-    y_pred = np.array(y_pred) >= 24.0/30
-    y_true = np.array(y_true) >= 24.0/30
+    y_pred = np.array(y_pred) >= 0.5
+    y_true = np.array(y_true) >= 0.5
     return roc_auc_score(y_true, y_pred)
 scorers = {
     'MSE': mean_squared_error,
     'AUC': auc
 }
 
+# TODO: Set seeds throughout the whole model
 def inv_vec(x, cols):
     return x.reshape(cols, -1).T
 def orthonormalize(x):
     return qr(x, mode='economic')[0]
-def b_next_iter(y,X,A,lmbda):
+def b_next_iter(y,X,A,lamb=0):
     R = A.shape[1]
+    lamb = lamb*np.prod(A.shape)
     Xa = [vec((x.T @ A).T) for x in X]
-    return inv_vec(Ridge(fit_intercept = False, alpha=lmbda).fit(Xa,y).coef_, R) # Ridge regression to stabilize B
-def a_next_iter(y,X,B,lmbda):
+    return inv_vec(Ridge(fit_intercept = False, alpha=lamb).fit(Xa,y).coef_, R) # Ridge regression to stabilize B
+def a_next_iter(y,X,B,lama=[0]):
     R = B.shape[1]
-    Xb = [vec((x @ B).T) for x in X]
-    return orthonormalize(inv_vec(Lasso(fit_intercept = False, alpha=lmbda).fit(Xb,y).coef_, R))
-def zeta_next_iter(y,Z,lmbdz=1):
+    A = np.zeros((R,X[0].shape[0]))
+    lama=lama*np.prod(B.shape)
+    lama=[lama,lama,lama] # TODO: test value to see if this works, then adjust assume R=3 for now
+    for r in range(R):
+        Xb = [vec((x @ B[:, r]).T) for x in X]
+        A[r] = Lasso(fit_intercept = False, alpha=lama[r]).fit(Xb,y).coef_
+    return orthonormalize(inv_vec(A, R))
+def zeta_next_iter(y,Z,lamz=0):
     # print(f"y: {y.shape}, Z: {Z.shape}")
-    return Ridge(fit_intercept = False, alpha=lmbdz).fit(Z, y).coef_
+    return Ridge(fit_intercept = False, alpha=lamz).fit(Z, y).coef_
 def score_AB(A,B,zeta=None,score=None):
     stability = np.var(B)/(norm(B, 2)**2)
     sparsity = np.where(vec(A) == 0)[0].shape[0]/vec(A).shape[0]
@@ -48,9 +55,9 @@ def score_AB(A,B,zeta=None,score=None):
     ]
     if score is not None:
         dif = np.array([
-            np.linalg.norm(score['B'] - B, 'fro'),#/norms[0],
-            np.linalg.norm(score['A'] - A, 'fro'),#/norms[1],
-            np.linalg.norm(score['zeta'] - zeta) if zeta is not None else 0 #/norms[2]
+            (np.linalg.norm(score['A'], 'fro') - norms[0])/norms[0],
+            (np.linalg.norm(score['B'], 'fro') - norms[1])/norms[1],
+            (np.linalg.norm(score['zeta']) - norms[2])/norms[2] if zeta is not None else 0
         ])
         history = score['history']
     else: 
@@ -71,7 +78,7 @@ def Rearrange(X,p,d):
             slices[dim].append(slice(d[dim]*i, d[dim]*(i+1)))
     Rx = [X[s].reshape(-1,1) for s in list(itertools.product(*slices))]
     return np.concatenate(Rx, axis=1).T
-def pack_parameters(named_tuple, static_params=None, mapped_params=[], max_vals=None):
+def pack_parameters(named_tuple, static_params=None, mapped_params=[], max_vals=None, seed=None):
     # TODO: error handling for empty static and mapped, edge case where pack_params is empty
     # TODO: check if named_tuple response works instead of tuple
     def flatten_tuple(tup):
@@ -79,7 +86,7 @@ def pack_parameters(named_tuple, static_params=None, mapped_params=[], max_vals=
     ordered_names = named_tuple._fields
     mapped_vals = zip(*[getattr(named_tuple, name) for name in mapped_params])
     static_vals = tuple([getattr(named_tuple, name) for name in static_params])
-    pack_params_fields = [field for field, value in named_tuple._asdict().items() if field not in set(mapped_params + static_params)]
+    pack_params_fields = [field for field, _ in named_tuple._asdict().items() if field not in set(mapped_params + static_params)]
     name_order = pack_params_fields + mapped_params + static_params
     order = tuple(name_order.index(name) for name in ordered_names)
     pack_params = [value for field, value in named_tuple._asdict().items() if field not in set(mapped_params + static_params)]
@@ -87,8 +94,9 @@ def pack_parameters(named_tuple, static_params=None, mapped_params=[], max_vals=
     ordered_parameters = [tuple(tup[i] for i in order) for tup in pack_parameters]
     all_parameters = [type(named_tuple)(*o)._asdict() for o in ordered_parameters]
     if max_vals is not None:
+        if seed is not None:
+            random.seed(seed)
         all_parameters = random.sample(all_parameters, max_vals)
-    # print(all_parameters[0])
     return all_parameters
 def relu(x):
     return np.maximum(0, x)
@@ -100,11 +108,12 @@ def calc_mbic(S,R,p):
     def mbic(y_true, y_pred):
         # print(R,p)
         Cn, n = [np.log(np.log(R*np.prod(p))), len(y_true)]
+        # return np.log(mse(y_true, y_pred))
         return np.log(mse(y_true, y_pred)) + (Cn * np.log(n)/n * S) + (2*S*np.log(0.1*np.prod(p)/4-1))
     return mbic
 
 class CSKPD(RegressorMixin, BaseEstimator):
-    def __init__(self,p=None,lama=0.0,lamb=0.0,lamz=0.0,R=1,g=Identity(),K=None,L=None,n_cores = -1,max_iter = 20,print_iter = 5,cuda=False):
+    def __init__(self,p=None,lama=0.0,lamb=0.0,lamz=0.0,R=1,g=Identity(),K=None,L=None,n_cores = -1,max_iter = 20,print_iter = 5,cuda=False,seed=None):
         self.p = p
         # self.d = d # d is now dependent on p
         self.lama = lama if type(lama) == list else [lama]
@@ -118,13 +127,14 @@ class CSKPD(RegressorMixin, BaseEstimator):
         self.max_iter = max_iter
         self.print_iter = print_iter
         self.cuda = cuda
+        self.seed = seed
 
         # Defined after init
         self.S, self.Cn, self.C = None, None, None
 
     def calc_y_hat(self,X,C,g=None):
         if g is None:
-            return [(np.vdot(x,C)) for x in X]
+            return [(np.vdot(x,C)) for i, x in enumerate(X)]
         else:
             return [g.inverse(np.vdot(x,C)) for x in X]
 
@@ -144,7 +154,7 @@ class CSKPD(RegressorMixin, BaseEstimator):
             A = a_next_iter(g(y)-z,Rx,B,lama)
             # TODO: Add another stopping criterion to ensure Z is stable
             if Z is not None:
-                C = sum([np.kron(A[:,r].reshape(*p),B[:,r].reshape(d)) for r in range(R)])
+                C = sum([np.kron(A[:,r].reshape(*p),B[:,r].reshape(*d)) for r in range(R)])
                 # print(f"C: {self.C.shape}, g(y): {len(g(y))}, X: {X.shape}")
                 zeta = zeta_next_iter(g(y)-np.array([np.vdot(x,C) for x in X]),Z,lamz)
                 z = np.array(Z @ zeta)
@@ -153,12 +163,14 @@ class CSKPD(RegressorMixin, BaseEstimator):
             if np.all(np.abs(score['dif']) < tol):
                 # print(f"Completed after {i} iterations.")
                 break
-        C = sum([np.kron(A[:,r].reshape(*p),B[:,r].reshape(d)) for r in range(R)])
+        C = sum([np.kron(A[:,r].reshape(*p),B[:,r].reshape(*d)) for r in range(R)])
         self.A = A
         self.B = B
         self.zeta = zeta
-        MSE = mse(g(y), self.calc_y_hat(X,C,g) + np.array(Z @ self.zeta) if Z is not None else self.calc_y_hat(X,C,g)) # MSE is for the generalized form
+        # g intentionally left off since y is generalized here
+        MSE = mse(g(y), self.calc_y_hat(X,C) + np.array(Z @ self.zeta) if Z is not None else self.calc_y_hat(X,C)) # MSE is for the generalized form
         S, Cn, n = [(1-score['sparsity']) * np.prod(d), np.log(np.log(R*np.prod(p))), len(y)]
+        # MBIC = np.log(MSE)
         MBIC = np.log(MSE) + (Cn * np.log(n)/n * S) + (2*S*np.log(0.05*np.prod(C.shape)/4-1))
         print_detail = f"Iter: {i}, Instability: {np.round(score['stability']*100,1)}%, Sparsity: {np.round(score['sparsity']*100,1)}%, MSE: {np.round(MSE,2)}, MBIC: {np.round(MBIC,2)}, dif: {score['dif']}, zeta: {zeta}"
 
@@ -166,7 +178,7 @@ class CSKPD(RegressorMixin, BaseEstimator):
     
     def fit(self, X, y, **kwargs):
         Z = kwargs.get('Z', None)
-        tol = kwargs.get('tol', 1e-6)
+        tol = kwargs.get('tol', 1e-3)
         static = kwargs.get('static', ["X", "y", "Z"])
         if self.p is None:
             p_list = []
@@ -221,37 +233,28 @@ class CSKPD(RegressorMixin, BaseEstimator):
         Z = kwargs.get('Z', None)
         # TODO: this needs to be corrected for g values
         g = self.g[0]
-        res = self.calc_y_hat(X,self.C,g) + np.array(Z @ self.zeta) if Z is not None else self.calc_y_hat(X,self.C,g)
+        z = np.array(Z @ self.zeta) if Z is not None else np.zeros(X.shape[0])
+        res = [g.inverse(np.vdot(x,self.C)+z[i]) for i,x in enumerate(X)]
         return res
-    
-    def calc_score(self, X, y, scorers, **kwargs):
-        k_folds = kwargs.get('k_folds', 5)
-        K = kwargs.get('K', None)
-        X = np.array([K.convolve(x) for x in X]) if K is not None else X
-        valid_params = {'Z', 'tol', 'static'}
-        fit_params = {k: v for k, v in kwargs.items() if k in valid_params}
-        results = cross_validate(self, X, y, cv=k_folds, scoring=scorers, return_estimator=True, params=fit_params)
-        for s in scorers:
-            print(f"{k_folds}-Fold CV {s} Scores: {results['test_'+s]*scorers[s]._sign}")
-            print(f"Average {k_folds}-Fold CV {s} Scores: {np.nanmean(np.array(results['test_'+s]))*scorers[s]._sign}")
-        return results
     
     def custom_cross_validate(self, X, y, scorers, k_folds=5, **kwargs):
         K = kwargs.get('K', None)
+        if K is not None:
+            assert type(K) == convolution, "K must be a convolution object."
+            X = np.array([K.convolve(x) for x in X]) 
         Z = kwargs.get('Z', None)
-        X = np.array([K.convolve(x) for x in X]) if K is not None else X
         valid_params = {'Z', 'tol', 'static', 'max_vals'}
         fit_params = {k: v for k, v in kwargs.items() if k in valid_params}
         pred_params = fit_params.copy()
 
         # Initialize a KFold object
-        kf = KFold(n_splits=k_folds)
+        kf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=0)
         
         # Initialize lists to store scores
         models = []
         scores = {key: [] for key in scorers}
         
-        for train_index, test_index in kf.split(X):
+        for train_index, test_index in kf.split(X, y):
             # Split the data
             X_train, X_test = X[train_index], X[test_index]
             y_train, y_test = y[train_index], y[test_index]
@@ -273,17 +276,16 @@ class CSKPD(RegressorMixin, BaseEstimator):
                 scores[scorer_name].append(score)
             
             results = {f'test_{key}': np.array(value) for key, value in scores.items()}
-            models.append({'model': model, 'results': results, 'y_hat': y_pred})
-
-        # Calculate the mean and std of each score
-        
+            models.append({'model': model, 'results': results, 'y_hat': y_pred, 'y_true': y_test})
         
         return models
     
+    # TODO: Finalize tree based ensemble model
     def model_of_models(self, model_parameters, **kwargs):
         all_models = []
+        # Formatted as array of dictionaries
         for params in model_parameters:
-            models = self.custom_cross_validate(self, **params, **kwargs)
+            models = self.custom_cross_validate(**params, **kwargs)
             preds = np.array([m['y_hat'] for m in models])
             auc = np.array([m['results']['test_AUC'] for m in models])
             aggregated_preds = relu(preds).sum(axis=0)
